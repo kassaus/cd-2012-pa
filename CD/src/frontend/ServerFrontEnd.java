@@ -230,8 +230,8 @@ public class ServerFrontEnd {
 
         Registry registry;
         try {
-            registry = LocateRegistry.getRegistry(host);
-            stub = (Interface) registry.lookup("Interface");
+            registry = LocateRegistry.getRegistry(host, 2005);
+            stub = (Interface) registry.lookup("ServerBackEnd");
             return stub.getTime() != null;
 
         } catch (RemoteException | NotBoundException e) {

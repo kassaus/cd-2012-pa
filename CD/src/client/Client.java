@@ -10,7 +10,15 @@ import java.io.InputStreamReader;
 import java.io.ObjectInputStream;
 import java.io.PrintStream;
 import java.io.PrintWriter;
+import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
+import java.nio.channels.SocketChannel;
+import java.nio.charset.Charset;
+import java.nio.charset.CharsetDecoder;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -18,6 +26,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Scanner;
+import java.util.Set;
 
 import util.FrontEndCommands;
 import util.ServerCommands;
@@ -96,11 +105,13 @@ public class Client {
     }
 
     @SuppressWarnings("unchecked")
-    private static void getTable(final Socket socket) {
+    private static void getTable(final String host) {
+        Socket socket = null;
         PrintStream output = null;
         ObjectInputStream input = null;
 
         try {
+            socket = new Socket(host, portTcp);
             output = new PrintStream(socket.getOutputStream(), true);
             output.println(getMessage(FrontEndCommands.GET_TABLE));
 
@@ -155,16 +166,13 @@ public class Client {
         }
 
         String cmd, receivedMessage = null;
-        ;
+
         String host = frontEndsList.getNextHost();
         String lastHost = null;
-        PrintStream output = null;
-        Socket socket = null;
-        BufferedReader stringInput = null;
         int triesCount = 0;
         Long lastAttempt = null;
         cmd = "";
-
+        // obter tabela
         while (true) {
             try {
                 debug("[DEBUG] Before getNextHost() " + frontEndsList.size());
@@ -186,68 +194,120 @@ public class Client {
                         lastHost = host;
 
                         System.out.println("A aguardar ligação com um servidor..." + (DEBUG ? " " + host : ""));
-                        socket = new Socket(host, portTcp);
-                        getTable(socket);
-
+                        getTable(host);
+                        //Guarda na sortedList a tabela enviada pelo front end devidamente ordenada
                         final List<String> sortedIpList = getSortedIpList();
 
                         updateNodesConfigFile(sortedIpList);
-                        updateFrontEndsList();
-
+                        updateFrontEndsList(); 
                         if (!host.equalsIgnoreCase(sortedIpList.get(0))) {
                             host = lastHost = sortedIpList.get(0);
-                            socket = new Socket(host, portTcp);
-                        }
-                    }
-
-                    stringInput = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-                    output = new PrintStream(socket.getOutputStream(), true);
-
-                    System.out.print(host + ":" + portTcp + "> ");
-
-                    if (cmd.isEmpty()) {
-                        final Scanner scan = new Scanner(System.in);
-                        cmd = scan.nextLine();
-                        if (FrontEndCommands.parse(cmd.toUpperCase()).toString().equals(FrontEndCommands.EXIT.name())) {
-                            System.exit(-1);
-                        }
-                    }
-
-                    output.println(getMessage(cmd.toUpperCase()));
-
-                    final StringBuilder str = new StringBuilder();
-                    while (!(receivedMessage = stringInput.readLine()).isEmpty()) {
-                        str.append(receivedMessage + "\n");
-                    }
-
-                    receivedMessage = str.toString();
-
-                    if (!receivedMessage.isEmpty()) {
-                        System.out.println("\nRecebido : \n" + receivedMessage);
-                        if (cmd.equalsIgnoreCase("quit")) {
-                            System.out.println("a sair..");
                             break;
-                        }
-                        cmd = "";
-                    } else {
-                        host = null;
-                        try {
-                            stringInput.close();
-                        } catch (final Exception e) {
-                        }
-                        try {
-                            output.close();
-                        } catch (final Exception e) {
-                        }
-
-                        try {
-                            socket.close();
-                        } catch (final Exception e) {
-                        }
+                        } 
                     }
                 }
+            }
+            catch (Exception e) {
+                System.out.println("Ocorreu um erro ao tentar aceder ao servidor. Aguarde enquanto tentamos uma nova ligação...");
+                frontEndsList.ignoreHost();
+                host = null;
+            }
+        }
 
-            } catch (final Exception ex) {
+        //Ligação ao servidor com menos carga
+        while (true) {
+            try {              
+                System.out.println("A tentar ligar ao FrontEnd: " + host);              
+
+                // Criação do SocketChannel
+                SocketChannel client = SocketChannel.open();
+                client.configureBlocking(false);
+                InetSocketAddress address = new InetSocketAddress(host,portTcp);
+                client.connect(address);
+
+                // Criar selector
+                Selector selector = Selector.open();
+
+                // Grava o seletor (OP_CONNECT type)
+                SelectionKey clientKey = client.register(selector,
+                        SelectionKey.OP_CONNECT);
+
+                // Espera por conecções               
+                while (selector.select(500) > 0) {
+
+                    // obtem chaves
+                    @SuppressWarnings("rawtypes")
+                    Set keys = selector.selectedKeys();
+
+                    @SuppressWarnings("rawtypes")
+                    Iterator i = keys.iterator();
+
+
+                    while (i.hasNext()) {
+                        SelectionKey key = (SelectionKey) i.next();
+                        // remove atual chave
+                        i.remove();
+
+                        SocketChannel channel = (SocketChannel) key.channel();
+
+                        if (key.isConnectable()) {                         
+                            if (channel.isConnectionPending())
+
+                                channel.finishConnect();                        
+                            System.out.println("Ligacao ao servidor estabelecida!");
+
+                            // Escreve no buffer
+                            int BUFFER_SIZE = 1024;
+                            ByteBuffer buffer = ByteBuffer.allocateDirect(BUFFER_SIZE);
+
+                            cmd ="";
+                            final Scanner scan = new Scanner(System.in);
+                            System.out.print(host + ":" + portTcp + "> ");
+                            for (;;) {
+                                if (cmd.isEmpty()) {                                        
+                                    cmd = scan.nextLine();
+                                    if (FrontEndCommands.parse(cmd.toUpperCase()).toString().equals(FrontEndCommands.EXIT.name())) {
+                                        System.exit(-1);
+                                    }
+                                }
+
+
+                                buffer = ByteBuffer.wrap(getMessage(cmd.toUpperCase()).getBytes());
+                                channel.write(buffer);
+                                buffer.clear();
+                                buffer = ByteBuffer.allocateDirect(BUFFER_SIZE);
+
+                                Thread.sleep(50);                       
+
+                                channel.read(buffer);
+                                buffer.flip();
+
+                                Charset charset = Charset.forName("ISO-8859-1");
+                                CharsetDecoder decoder = charset.newDecoder();
+                                CharBuffer charBuffer = decoder.decode(buffer);                  
+
+
+                                final StringBuilder str = new StringBuilder();
+                                while (!(receivedMessage = charBuffer.toString()).isEmpty()) {
+                                    str.append(receivedMessage + "\n");
+                                }
+
+                                receivedMessage = str.toString();
+                                cmd="";
+
+                                if (!receivedMessage.isEmpty()) {
+                                    System.out.println("\nRecebido : \n" + receivedMessage);
+                                    if (cmd.equalsIgnoreCase("quit")) {
+                                        System.out.println("a sair..");
+                                        break;// ver se o Break Funcionaehdhdd
+                                    }
+                                }                                                            
+                            }
+                        }              
+                    }
+                }
+            }catch (final Exception ex) {
+
                 if (triesCount == 0) {
                     System.out.println("Ocorreu um erro ao tentar aceder ao servidor. Aguarde enquanto tentamos uma nova ligação...");
                 } else if (triesCount <= 5) {
@@ -255,22 +315,6 @@ public class Client {
                 } else {
                     System.out.println("Ocorreu um erro ao tentar aceder ao servidor. Aguarde enquanto tentamos uma ligação com outro servidor...");
                 }
-
-                try {
-                    stringInput.close();
-                } catch (final Exception e) {
-                }
-
-                try {
-                    output.close();
-                } catch (final Exception e) {
-                }
-
-                try {
-                    socket.close();
-                } catch (final Exception e) {
-                }
-
                 if (triesCount > 5) {
                     host = null;
                     triesCount = 0;
@@ -278,16 +322,10 @@ public class Client {
                     triesCount++;
                     lastAttempt = System.currentTimeMillis();
                 }
-
                 lastHost = null;
             }
         }
-
-        stringInput.close();
-        output.close();
-        socket.close();
     }
-
     private static void printHelp() {
         System.out.println("\t---Comandos suportados pelo Cliente---");
         System.out.println();
